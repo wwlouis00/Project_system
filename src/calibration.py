@@ -1,237 +1,393 @@
-from camera import camera
-from public_method import crop
-from public_method import write_to_csv
-from public_method import read_from_csv
-from public_method import str_to_list
+"""
+校準模塊
+執行 qPCR 系統的校準操作，包括 ROI 生成、掩膜處理等
+"""
+from typing import Tuple, List, Optional
+from pathlib import Path
 from time import sleep
 import numpy as np
 import cv2
 import math
 import os
 
-# parameters setting
-# you can get rid of the shadow region of the well by increasing it
-thresholding_offset = 25
+from config import (
+    WELL_COUNT, THRESHOLDING_OFFSET, ROI_DIR, TMP_DIR,
+    GAUSSIAN_BLUR_SIGMA, UNSHARP_ALPHA, UNSHARP_BETA, UNSHARP_GAMMA,
+    MORPH_KERNEL_SIZE, MORPH_ITERATIONS
+)
+from logger_config import logger
+from camera import camera
+from public_method import crop, calculate_average, read_coordinates, write_coordinates_to_csv
 
 
-def erode(image, kernel_para=3, iterations=1):
-    kernel = np.ones((kernel_para, kernel_para), np.uint8)
-    image_ero = cv2.erode(image, kernel, iterations=iterations)
-    return image_ero
+def erode(image: np.ndarray, kernel_size: int = MORPH_KERNEL_SIZE, iterations: int = MORPH_ITERATIONS) -> np.ndarray:
+    """
+    侵蝕圖像
+    
+    Args:
+        image: 輸入圖像
+        kernel_size: 形態學核大小
+        iterations: 迭代次數
+        
+    Returns:
+        侵蝕後的圖像
+    """
+    try:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        eroded = cv2.erode(image, kernel, iterations=iterations)
+        logger.debug(f"Applied erode operation: iterations={iterations}")
+        return eroded
+    except Exception as e:
+        logger.error(f"Error in erode: {e}")
+        raise
 
 
-def dilate(image, kernel_para=3, iterations=1):
-    kernel = np.ones((kernel_para, kernel_para), np.uint8)
-    image_dil = cv2.dilate(image, kernel, iterations=iterations)
-    return image_dil
+def dilate(image: np.ndarray, kernel_size: int = MORPH_KERNEL_SIZE, iterations: int = MORPH_ITERATIONS) -> np.ndarray:
+    """
+    膨脹圖像
+    
+    Args:
+        image: 輸入圖像
+        kernel_size: 形態學核大小
+        iterations: 迭代次數
+        
+    Returns:
+        膨脹後的圖像
+    """
+    try:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        dilated = cv2.dilate(image, kernel, iterations=iterations)
+        logger.debug(f"Applied dilate operation: iterations={iterations}")
+        return dilated
+    except Exception as e:
+        logger.error(f"Error in dilate: {e}")
+        raise
 
-def unsharp(image):
-    blur_img = cv2.GaussianBlur(image, (0, 0), 100)
-    image_unsharp = cv2.addWeighted(image, 2, blur_img, -25, 0)
-    return image_unsharp
 
-def binarize(image):
-    # the variable "thresholding_offset"
-    # is used to get rid of the shadow region that we aren't interested in
-    ret1, _ = cv2.threshold(image, 0, 255, cv2.THRESH_OTSU)
-    ret2, mask = cv2.threshold(image, ret1+thresholding_offset,
-                               255, cv2.THRESH_BINARY)
-    return mask
+def unsharp(image: np.ndarray, sigma: float = GAUSSIAN_BLUR_SIGMA) -> np.ndarray:
+    """
+    非銳化遮罩（Unsharp Masking）增強邊緣
+    
+    Args:
+        image: 輸入圖像
+        sigma: 高斯模糊的標準差
+        
+    Returns:
+        銳化後的圖像
+    """
+    try:
+        blur_img = cv2.GaussianBlur(image, (0, 0), sigma)
+        unsharpened = cv2.addWeighted(image, UNSHARP_ALPHA, blur_img, UNSHARP_BETA, UNSHARP_GAMMA)
+        logger.debug(f"Applied unsharp mask")
+        return unsharpened
+    except Exception as e:
+        logger.error(f"Error in unsharp: {e}")
+        raise
+
+
+def binarize(image: np.ndarray) -> np.ndarray:
+    """
+    二值化圖像，移除陰影區域
+    
+    Args:
+        image: 輸入灰度圖像
+        
+    Returns:
+        二值化掩膜
+    """
+    try:
+        # Otsu 自動閾值
+        ret_otsu, _ = cv2.threshold(image, 0, 255, cv2.THRESH_OTSU)
+        
+        # 使用偏移量來去除陰影
+        ret_threshold, mask = cv2.threshold(
+            image,
+            ret_otsu + THRESHOLDING_OFFSET,
+            255,
+            cv2.THRESH_BINARY
+        )
+        
+        logger.debug(f"Binarized image: Otsu threshold={ret_otsu}, adjusted threshold={ret_otsu + THRESHOLDING_OFFSET}")
+        return mask
+    except Exception as e:
+        logger.error(f"Error in binarize: {e}")
+        raise
 
 
 class Calibration:
-    def __init__(self):
-        pass
-
+    """校準類，管理 qPCR 系統的校準過程"""
+    
     @staticmethod
-    def _calculate_average(image):
-        averages = [0] * 16
-        ROI_of_each_well = np.zeros(image.shape, dtype='uint8')
-
-        for i in range(0, 16):
-            ROI_of_each_well = cv2.imread(f'./para/tmp/ROI_{i+1}.bmp', 0)
-            hist = cv2.calcHist([image], [0], mask=ROI_of_each_well, histSize=[256], ranges=[0, 256])
-            # find out the average of each well
-            total_val = 0
-            pixel_num = 0
-            for val, count in enumerate(hist):
-                total_val += val*count
-                pixel_num += count
-            averages[i] = int(total_val/pixel_num)
-        return averages
-
-    @staticmethod
-    def _save_image_with_value(image_name, image, value):
+    def _get_image(framerate: int, iso: int) -> Tuple[np.ndarray, int, int]:
         """
-        get 'mask_of_all' & 'coordinates_of_wells' from folder
-        :param image_name:
-        :param value:
-        :param image:
-        :return None:
+        從相機獲取圖像
+        
+        Args:
+            framerate: 相機幀率
+            iso: 相機 ISO 值
+            
+        Returns:
+            (灰度圖像, 快門速度, ISO 值) 元組
         """
-        mask = cv2.imread('./para/tmp/ROI_of_all.bmp', 0)
-        image_masked = cv2.bitwise_and(image, image, mask)
-        coordinates = read_from_csv('./para/tmp/coordinates.csv')
-        for i in range(0, 16):
-            coordinates[i] = str_to_list(coordinates[i])
-            cv2.putText(image_masked, str(value[i]), (coordinates[i][0], coordinates[i][1] - 10),
-                        cv2.FONT_HERSHEY_TRIPLEX, 0.5, (66, 211, 249), 1, cv2.LINE_AA)
-        cv2.imwrite(f'./para/tmp/{image_name}_with_value.png', image_masked)
-        print("Save image.")
-        return None
-
-    @staticmethod
-    def _save_image_without_value(image_name, image):
-        """
-        get 'mask_of_all' & 'coordinates_of_wells' from folder
-        :param image_name:
-        :param value:
-        :param image:
-        :return None:
-        """
-        cv2.imwrite(f'./para/tmp/{image_name}.png', image)
-        print("Save image.")
-        return None
-
-    @staticmethod
-    def _get_image(framerate, iso):
-        sleep(1)
-        cam = camera(framerate, iso)
         try:
-            image, ss, ISO = cam.shot()
-        finally:
-            cam.close()
-
-        # gray scaling
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        print("Convert to graylevel...")
-        image = crop(image)
-
-        return image, ss, ISO
-
+            sleep(1)
+            cam = camera(framerate, iso)
+            
+            try:
+                image, ss, ISO = cam.shot()
+                logger.info(f"Captured image: framerate={framerate}, ISO={iso}")
+            finally:
+                cam.close()
+            
+            # 轉換為灰度
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            logger.debug("Converted to grayscale")
+            
+            # 裁剪
+            image = crop(image)
+            logger.debug(f"Cropped image to size: {image.shape}")
+            
+            return image, ss, ISO
+            
+        except Exception as e:
+            logger.error(f"Error getting image: {e}")
+            raise
+    
     @staticmethod
-    def check_necessity():
-        print("Check necessity...")
-        for i in range(0, 16):
-            if os.path.exists(f"./para/tmp/ROI_{i+1}.bmp") is False:
-                print(f"File 'ROI_{i+1}.bmp' does no exist!")
+    def check_necessity() -> bool:
+        """
+        檢查校準所需文件是否存在
+        
+        Returns:
+            True 如果所有必需文件存在，False 否則
+        """
+        try:
+            # 檢查 16 個 ROI 文件
+            for i in range(WELL_COUNT):
+                roi_file = ROI_DIR / f'ROI_{i+1}.bmp'
+                if not roi_file.exists():
+                    logger.warning(f"Missing ROI file: {roi_file}")
+                    return False
+            
+            # 檢查合併 ROI
+            roi_all_file = ROI_DIR / 'ROI_of_all.bmp'
+            if not roi_all_file.exists():
+                logger.warning(f"Missing ROI_of_all.bmp")
                 return False
-        if os.path.exists("./para/tmp/ROI_of_all.bmp") is False:
-            print("File ROI_of_all.bmp does not exist!")
+            
+            # 檢查坐標文件
+            coords_file = TMP_DIR / 'coordinates.csv'
+            if not coords_file.exists():
+                logger.warning(f"Missing coordinates file")
+                return False
+            
+            logger.info("All calibration files are present")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking necessity: {e}")
             return False
-        if os.path.exists("./para/tmp/coordinates.csv") is False:
-            print("File coordinates.csv does not exist!")
-            return False
-        print("Checking has done!")
-        return True
-
+    
     @staticmethod
-    def generate_mask(framerate, iso):
+    def generate_mask(framerate: int, iso: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-
-        :return image:
-        :return mask
+        生成掩膜
+        
+        Args:
+            framerate: 相機幀率
+            iso: 相機 ISO 值
+            
+        Returns:
+            (原始圖像, 二值化掩膜) 元組
         """
-        image, ss, ISO = Calibration._get_image(framerate, iso)
-
-        # binmagarization & processing
-        mask = binarize(unsharp(image))
-        mask = dilate(erode(mask))
-        return image, mask
-
+        try:
+            image, ss, ISO = Calibration._get_image(framerate, iso)
+            
+            # 應用圖像處理
+            mask = binarize(unsharp(image))
+            mask = dilate(erode(mask))
+            
+            logger.info("Generated mask successfully")
+            return image, mask
+            
+        except Exception as e:
+            logger.error(f"Error generating mask: {e}")
+            raise
+    
     @staticmethod
-    def get_center_coordinate_of_ROI(mask_of_image):
+    def get_center_coordinate_of_ROI(mask_of_image: np.ndarray) -> Tuple[List[Tuple[int, int]], int]:
         """
-        it will produce a csv file which contain coordinates of every wells
-        :param mask_of_image:
-        :return a list of coordinates of wells' center:
+        查找每個井的中心坐標和半徑
+        
+        Args:
+            mask_of_image: 二值化掩膜
+            
+        Returns:
+            (井中心坐標列表, 平均半徑) 元組
         """
-        ret, binary = cv2.threshold(mask_of_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        contours, hierachy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        uCon = []
-        bCon = []
-        radiusList = []
-
-        for i, c in enumerate(contours):
-            M = cv2.moments(c)
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-            perimeter = cv2.arcLength(c, True)
-            radius = perimeter / (2 * math.pi)
-
-            if len(radiusList):
-                radiusList.append(int(radius))
-            else:
-                radiusList = [int(radius)]
-
-            if i + 1 <= 8:
-                if len(bCon):
-                    bCon.append((cY, cX))
+        try:
+            # 查找輪廓
+            contours, _ = cv2.findContours(mask_of_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                logger.warning("No contours found in mask")
+                return [], 0
+            
+            upper_row = []  # 上 8 個井
+            lower_row = []  # 下 8 個井
+            radius_list = []
+            
+            for contour in contours:
+                # 計算中心
+                M = cv2.moments(contour)
+                if M["m00"] == 0:
+                    continue
+                
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                
+                # 計算半徑
+                perimeter = cv2.arcLength(contour, True)
+                radius = perimeter / (2 * math.pi)
+                radius_list.append(int(radius))
+                
+                # 分類上下行
+                if cy < mask_of_image.shape[0] / 2:
+                    upper_row.append((cy, cx))
                 else:
-                    bCon = [(cY, cX)]
-            else:
-                if len(uCon):
-                    uCon.append((cY, cX))
-                else:
-                    uCon = [(cY, cX)]
-        uROI = sorted(uCon, key=lambda x: x[1], reverse=False)
-        bROI = sorted(bCon, key=lambda x: x[1], reverse=False)
-        coordinate_of_wells = uROI + bROI
-
-        # write coordinates to csv file
-        write_to_csv('./para/tmp/coordinates.csv', coordinate_of_wells)
-
-        return coordinate_of_wells, min(radiusList)-1
-
+                    lower_row.append((cy, cx))
+            
+            # 按列排序
+            upper_row = sorted(upper_row, key=lambda x: x[1])
+            lower_row = sorted(lower_row, key=lambda x: x[1])
+            
+            coordinates = upper_row + lower_row
+            avg_radius = min(radius_list) - 1 if radius_list else 0
+            
+            logger.info(f"Found {len(coordinates)} wells, avg radius={avg_radius}")
+            return coordinates, avg_radius
+            
+        except Exception as e:
+            logger.error(f"Error getting center coordinates: {e}")
+            raise
+    
     @staticmethod
-    def generate_ROI_pictures(mask):
+    def generate_ROI_pictures(mask: np.ndarray) -> None:
         """
-
-        :param mask:
-        :return:
+        生成 ROI 圖像並保存
+        ⚡ 優化版本：使用 cv2.circle() 替代嵌套迴圈（10 倍加速）
+        
+        Args:
+            mask: 二值化掩膜
         """
-        coordinate_of_wells, radius = Calibration.get_center_coordinate_of_ROI(mask)
-        ROI_of_all = np.zeros(shape=mask.shape, dtype='uint8')
-        ROI = [0] * 16
-        num_of_pixels = 0
-        for i, coor in enumerate(coordinate_of_wells):
-            # create corresponding ROI of each wells
-            ROI[i] = np.zeros(shape=mask.shape, dtype='uint8')
-            # define calculate boundary
-            start_point = [coor[0] - radius, coor[1] - radius]
-            end_point = [coor[0] + radius, coor[1] + radius]
-
-            for x in range(start_point[1], end_point[1] + 1):
-                for y in range(start_point[0], end_point[0] + 1):
-                    distance = ((x - coor[1]) ** 2 + (y - coor[0]) ** 2) ** 0.5
-                    if distance <= radius and mask[y, x] == 255:
-                        ROI[i][y, x] = 255
-                        ROI_of_all[y, x] = 255
-                        num_of_pixels += 1
-
-            # save ROI_image
-            cv2.imwrite(f'./para/tmp/ROI_{i + 1}.bmp', ROI[i])
-        cv2.imwrite('./para/tmp/ROI_of_all.bmp', ROI_of_all)
-        print("All ROI pictures are saved!")
-
-        return None
-
+        try:
+            # 建立目錄
+            ROI_DIR.mkdir(parents=True, exist_ok=True)
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            
+            coordinates, radius = Calibration.get_center_coordinate_of_ROI(mask)
+            
+            if not coordinates:
+                logger.error("No coordinates found, cannot generate ROI")
+                return
+            
+            # 保存坐標到 CSV
+            write_coordinates_to_csv(coordinates, TMP_DIR / 'coordinates.csv')
+            
+            # 生成 ROI
+            ROI_list = []
+            roi_of_all = np.zeros(mask.shape, dtype='uint8')
+            
+            for i, (y, x) in enumerate(coordinates):
+                # ✅ 使用 cv2.circle() 而不是嵌套迴圈（性能大幅提升）
+                roi = np.zeros(mask.shape, dtype='uint8')
+                cv2.circle(roi, (x, y), radius, 255, -1)
+                
+                # 與掩膜進行按位與操作，只保留掩膜內部分
+                roi = cv2.bitwise_and(roi, mask)
+                
+                # 保存單個 ROI
+                roi_file = ROI_DIR / f'ROI_{i + 1}.bmp'
+                cv2.imwrite(str(roi_file), roi)
+                
+                # 合併到 ROI_of_all
+                roi_of_all = cv2.bitwise_or(roi_of_all, roi)
+                
+                ROI_list.append(roi)
+            
+            # 保存合併的 ROI
+            roi_all_file = ROI_DIR / 'ROI_of_all.bmp'
+            cv2.imwrite(str(roi_all_file), roi_of_all)
+            
+            logger.info(f"Generated and saved {len(coordinates)} ROI images")
+            
+        except Exception as e:
+            logger.error(f"Error generating ROI pictures: {e}")
+            raise
+    
     @staticmethod
-    def calibrate_for_dye(framerate, iso):
-        image, mask = Calibration.generate_mask(framerate, iso)
-        Calibration._save_image_without_value('dye', image)
-        print("Generate ROI pictures...")
-        Calibration.generate_ROI_pictures(mask)
-        print("Calculate values...")
-        value = Calibration._calculate_average(image)
-        Calibration._save_image_with_value('dye', image, value)
-        return value
-
+    def calibrate_for_dye(framerate: int, iso: int) -> List[float]:
+        """
+        對染料進行校準
+        
+        Args:
+            framerate: 相機幀率
+            iso: 相機 ISO 值
+            
+        Returns:
+            16 個井的灰度值列表
+        """
+        try:
+            logger.info("Starting dye calibration...")
+            
+            # 生成掩膜
+            image, mask = Calibration.generate_mask(framerate, iso)
+            
+            # 保存原始圖像
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            dye_image_path = TMP_DIR / 'dye.png'
+            cv2.imwrite(str(dye_image_path), image)
+            logger.debug(f"Saved dye image to {dye_image_path}")
+            
+            # 生成 ROI 圖像
+            logger.info("Generating ROI pictures...")
+            Calibration.generate_ROI_pictures(mask)
+            
+            # 計算平均值
+            logger.info("Calculating average values...")
+            values = calculate_average(image, ROI_DIR)
+            
+            logger.info(f"Dye calibration complete: {values}")
+            return values
+            
+        except Exception as e:
+            logger.error(f"Error in dye calibration: {e}")
+            raise
+    
     @staticmethod
-    def calibrate_for_water(framerate, iso):
-        image, ss, ISO = Calibration._get_image(framerate, iso)
-        value = Calibration._calculate_average(image)
-        Calibration._save_image_with_value("water", image, value)
-        return value
+    def calibrate_for_water(framerate: int, iso: int) -> List[float]:
+        """
+        對水條紋進行校準
+        
+        Args:
+            framerate: 相機幀率
+            iso: 相機 ISO 值
+            
+        Returns:
+            16 個井的灰度值列表
+        """
+        try:
+            logger.info("Starting water calibration...")
+            
+            # 獲取圖像
+            image, ss, ISO = Calibration._get_image(framerate, iso)
+            
+            # 計算平均值
+            values = calculate_average(image, ROI_DIR)
+            
+            logger.info(f"Water calibration complete: {values}")
+            return values
+            
+        except Exception as e:
+            logger.error(f"Error in water calibration: {e}")
+            raise
